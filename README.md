@@ -1,22 +1,24 @@
 # Monclova LMP — Pipeline de analítica de precios
 
 Pipeline reproducible para los **Precios Marginales Locales** de los 9 nodos de la zona de carga
-Monclova (Sistema Interconectado Nacional, CENACE), con dos tracks en producción:
+Monclova (Sistema Interconectado Nacional, CENACE), sobre 18 meses de datos horarios:
 
-- **Forecasting** del MDA (Mercado del Día en Adelanto), horizontes de 1 hora y day-ahead.
+- **Pronóstico** del MDA (Mercado del Día en Adelanto), horizontes de 1 hora y día completo.
 - **Detección de anomalías** sobre el MTR (Mercado de Tiempo Real).
+
+236,304 registros extraídos del servicio web público de CENACE.
 
 ---
 
 ## Instalación
 
 ```bash
-pip install -r requirements.txt          # pipeline de producción
-pip install -r requirements-modeling.txt # además, para correr los notebooks
+pip install -r requirements.txt            # pipeline
+pip install -r requirements-modeling.txt   # además, para los notebooks
 ```
 
-El pipeline de producción **no** requiere TensorFlow ni scikit-learn. LSTM, ARIMAX, Isolation Forest
-y LOF se evaluaron y descartaron; viven solo en los notebooks de selección de modelo.
+El pipeline **no** requiere TensorFlow. LSTM, ARIMAX, Isolation Forest y LOF se evaluaron, se
+descartaron, y viven solo en los notebooks de selección de modelo.
 
 ---
 
@@ -27,10 +29,13 @@ y LOF se evaluaron y descartaron; viven solo en los notebooks de selección de m
 | 1 | Extracción | `scripts/extract.py` | API SW-PML de CENACE | `data/raw/monclova_lmp_mda_mtr.csv` |
 | 2 | Preprocesamiento | `scripts/preprocess.py` | CSV crudo | `data/processed/monclova_lmp_clean.csv` |
 | 3 | Features | `scripts/build_features.py` | CSV limpio | `monclova_features_{mda,mtr}.csv` |
-| 4a | Forecasting | `scripts/run_forecasting.py` | features MDA | métricas, figuras, pronósticos |
-| 4b | Anomalías | `scripts/run_anomaly_detection.py` | features MTR + MDA | métricas, figuras, alertas |
+| 4a | Pronóstico | `scripts/run_forecasting.py` | features MDA | CSV de predicciones + modelos |
+| 4b | Anomalías | `scripts/run_anomaly_detection.py` | features MTR | CSV de alertas + figura |
 
 Las etapas 4a y 4b son independientes entre sí y ambas dependen de la 3.
+
+**Los scripts son el camino operativo.** No calculan métricas ni comparan modelos: implementan el
+modelo ya decidido. La evaluación vive en los notebooks (ver más abajo).
 
 ---
 
@@ -39,11 +44,10 @@ Las etapas 4a y 4b son independientes entre sí y ambas dependen de la 3.
 ### Todo junto
 
 ```bash
-./run_pipeline.sh daily      # ruta diaria: MDA -> pronóstico
-./run_pipeline.sh mtr        # ruta rezagada: MTR -> alertas
-./run_pipeline.sh backtest   # reevaluación de ambos modelos
+./run_pipeline.sh daily                        # ruta diaria: MDA -> pronóstico
+./run_pipeline.sh mtr                          # ruta rezagada: MTR -> alertas
 ./run_pipeline.sh full 2024-01-01 2025-06-30   # carga histórica completa
-./run_pipeline.sh test       # tests de invariantes
+./run_pipeline.sh test                         # tests de invariantes
 ```
 
 **Por qué dos rutas y no una.** Los dos tracks no pueden correr en la misma cadencia. El MDA se
@@ -59,91 +63,126 @@ python scripts/extract.py --start 2025-07-01 --end 2025-07-15 --processes MDA
 python scripts/extract.py --start 2025-07-01 --end 2025-07-15 --dry-run   # sin llamar a la API
 python scripts/preprocess.py --verbose
 python scripts/build_features.py --test-start 2025-04-01
-python scripts/run_forecasting.py --mode backtest
-python scripts/run_forecasting.py --mode predict
-python scripts/run_anomaly_detection.py --mode backtest
-python scripts/run_anomaly_detection.py --mode predict --lookback-days 30
+python scripts/run_forecasting.py
+python scripts/run_anomaly_detection.py
 ```
 
-Todos aceptan `--config`, `--verbose` y `--help`. Por defecto imprimen solo un resumen corto;
+Todos aceptan `--config`, `--verbose` y `--help`. Por defecto imprimen un resumen corto;
 `--verbose` activa el detalle.
+
+### Si ya tienes el CSV crudo
+
+Colócalo en `data/raw/monclova_lmp_mda_mtr.csv` y salta la extracción. El resto del pipeline tarda
+unos 5 minutos, dominados por el ajuste de MSTL en la detección de anomalías.
 
 ---
 
 ## Resultados
 
-### Forecasting (MDA)
+### Pronóstico (MDA)
 
-Evaluación sobre la ventana de test (abril-junio 2025), promedio de los 9 nodos:
+Evaluación sobre la ventana de test (abril-junio 2025), nodo piloto `06MON-115`:
 
 | Horizonte | XGBoost | Naive estacional | Mejora |
 |---|---|---|---|
-| 1h adelante | **86.7** | 167.8 | **48%** |
-| day-ahead | **132.8** | 206.1 | **36%** |
+| 1h adelante | **86.5** | 167.5 | **−48%** |
+| día completo | **135.4** | 205.7 | **−34%** |
 
-MAE en $/MWh. El baseline naive estacional (mismo valor de la hora anterior equivalente) es el
-control que responde si el modelo aporta valor sobre una regla trivial. La desviación entre nodos es
-de 0.26 y 0.55 respectivamente, coherente con que los 9 nodos son la misma señal de precio.
+MAE en $/MWh. El baseline naive estacional (mismo valor de la hora equivalente del día o la semana
+anterior) es lo que haría un analista sin modelo. **Ese porcentaje es el resultado**, no el MAE
+absoluto: sin referencia, un error de 86 no dice si el modelo aporta algo.
+
+XGBoost se comparó contra LSTM y ARIMAX+Fourier y ganó en ambos horizontes. Detalle en
+`notebooks/model_selection/forecasting.ipynb`.
+
+El horizonte de día completo tiene más error porque tiene **estrictamente menos información**: al
+pronosticar las 24 horas del día siguiente solo se dispone de datos hasta el cierre del día actual,
+así que no hay lags de corto plazo y las medias móviles se sustituyen por agregados diarios
+congelados. No es que el modelo sea peor; el problema es más difícil.
 
 ### Detección de anomalías (MTR)
 
-| Detector | Recall de evento | Precisión de evento | F1 |
-|---|---|---|---|
-| M4 (residual MSTL) | 0.306 | **0.833** | 0.380 |
-| M1 (residual robusto) | **0.368** | 0.750 | 0.377 |
+Cuatro métodos evaluados contra la etiqueta proxy, sobre el nodo piloto:
 
-Contra una línea base aleatoria de 0.0093. La severidad sale del consenso entre ambos: la tasa de
-acierto pasa de **0.6%** sin detectores a **39.7%** con uno y **80.0%** con los dos.
+| Detector | Precisión | Recall | F1 | PR-AUC |
+|---|---|---|---|---|
+| **M4 — residual MSTL** | **0.833** | 0.246 | 0.380 | **0.531** |
+| M1 — residual robusto | 0.520 | 0.295 | 0.377 | 0.423 |
+| M2 — Isolation Forest | 0.469 | 0.197 | 0.277 | 0.307 |
+| M3 — naive estacional (baseline) | 0.200 | 0.098 | 0.132 | 0.163 |
 
-### Validación de estabilidad
+La línea base aleatoria ronda **0.009**, así que un PR-AUC de 0.531 es unas 57 veces mejor que el
+azar. En detección no supervisada evaluada contra una etiqueta construida, valores cercanos a 1
+serían motivo de sospecha, no de tranquilidad.
 
-Además del corte único, el pipeline soporta backtesting **rolling-origin** sobre cuatro épocas del
-año (`--rolling 4`). XGBoost supera al baseline estacional en los cuatro pliegues y en ambos
-horizontes; la magnitud del error varía de forma estacional, siendo el verano la ventana más
-difícil. Los resultados detallados quedan en `outputs/metrics/`.
+**Producción opera M4**, que gana en precisión y en PR-AUC, la métrica independiente del umbral.
+Sobre los 18 meses emite **1,125 alertas**, con una tasa efectiva del 1.01% frente al 1.0%
+objetivo, repartidas uniformemente entre los nueve nodos (125 cada uno).
 
-## Los dos modos de los scripts de modelado
+---
 
-| | `--mode backtest` | `--mode predict` |
+## Hallazgos que condicionan la operación
+
+### Los nueve nodos son una sola señal de precio
+
+Correlación de **1.0000** entre ellos. La explicación es física, no estadística: comparten el
+componente de energía y no hay congestión intrazonal, así que solo difieren en pérdidas marginales.
+
+Consecuencia: un solo conjunto de hiperparámetros para los nueve. Tunear por nodo capturaría ruido
+de muestreo, no diferencias reales. El detector de anomalías emite exactamente 125 alertas por
+nodo, que es la confirmación empírica de lo mismo.
+
+### El mercado cambia de régimen, y eso rompe los umbrales fijos
+
+Los umbrales se calibran al 1% de tasa de alerta sobre el periodo de entrenamiento. En la ventana
+de prueba, **los cuatro detectores caen por debajo de la mitad de su tasa objetivo**:
+
+| Detector | train | test |
 |---|---|---|
-| Entrenamiento | solo `split == train` | **todo** el histórico disponible |
-| Evaluación | contra el test conocido | ninguna: la verdad aún no existe |
-| Salida | métricas + figuras | CSV de pronósticos / alertas |
-| Cuándo | al cambiar el pipeline, o periódicamente | en cada corrida operativa |
+| M1 | 0.94% | 0.53% |
+| M2 | 0.99% | 0.39% |
+| M3 | 0.94% | 0.46% |
+| M4 | 0.94% | **0.28%** |
 
-La diferencia no es cosmética. En backtest hay que **excluir** del entrenamiento todo lo posterior
-al corte, o las métricas mienten por fuga. En predict hay que **incluirlo todo**, o se desperdicia
-información reciente. Misma lógica de features, frontera temporal invertida.
+No es una peculiaridad de un método: es una propiedad del periodo. La dispersión de la divergencia
+entre lo esperado y lo realizado cae sustancialmente entre ambas ventanas, y un umbral calibrado en
+el régimen volátil queda demasiado alto para el tranquilo.
 
----
+**Esta es la justificación empírica de la recalibración periódica**, no una buena práctica citada
+de un manual. Es la prioridad 1 de los siguientes pasos.
 
-## Dónde vive cada salida
+### Los huecos de publicación se concentran en feriados
 
-```
-data/raw/          CSV crudo consolidado y checkpoints por proceso
-data/processed/    CSV limpio, features por proceso, anomalías del backtest
-outputs/metrics/   métricas por corrida (JSON y CSV), una por etapa
-outputs/figures/   solo las figuras validadas para presentar
-outputs/reports/   trazabilidad de calidad de datos, una fila por evento
-outputs/models/    modelos serializados (formato nativo XGBoost, no pickle)
-outputs/predictions/  pronósticos y alertas del modo predict
-```
-
-Todos los artefactos llevan el `run_id` (`YYYYMMDDTHHMMSS`) en el nombre, y cada fila del CSV de
-pronósticos referencia el archivo de modelo que la produjo. Si dentro de un año alguien pregunta
-por qué el pronóstico de una hora decía lo que decía, el modelo exacto está en disco.
+252 registros (28 horas × 9 nodos, el 0.21% del MDA) con los cuatro componentes de precio en 0.0
+simultáneamente. Cinco de las seis fechas afectadas son feriado o domingo: 1 de enero de 2024 y
+2025, 25 de diciembre, Domingo de Pascua. No es un precio de mercado, es un hueco de la fuente.
 
 ---
 
-## Configuración
+## Cómo se define una anomalía sin etiquetas
 
-Todo vive en `config/config.yaml`: rutas, nodos, rezagos de publicación, lags, ventanas,
-hiperparámetros y umbrales. Los scripts no hardcodean parámetros.
+CENACE no publica un catálogo de horas anómalas, así que la referencia hay que construirla, y esa
+construcción es una decisión que hay que argumentar.
 
-**Los hiperparámetros están congelados y no se re-tunean en producción.** Provienen del tuning con
-`RandomizedSearchCV` + `TimeSeriesSplit` sobre el nodo piloto `06MON-115`. Se comparten entre los 9
-nodos porque el MAE entre nodos fue 86.71 ± 0.21 (h1) y 133.89 ± 0.82 (day-ahead): con esa
-dispersión, el tuning individual capturaba ruido de muestreo, no diferencias reales.
+> Una anomalía de tiempo real no es "un precio alto", es **un precio que el día en adelanto no
+> anticipó**.
+
+El MDA es la expectativa publicada del mercado; el MTR es la realización. La divergencia entre
+ambos define el evento. Dos propiedades la hacen válida:
+
+**No es circular.** Los detectores se construyen exclusivamente sobre la serie MTR; el MDA nunca
+entra como variable de entrada. La etiqueta es información externa al detector.
+
+**Es desplegable.** No es un artificio de evaluación: en producción el spread se puede calcular
+siete días después del Día de Operación y sirve como monitoreo continuo del propio sistema.
+
+La construcción tiene cuatro pasos (log-ratio, remoción del perfil horario, escala móvil causal de
+30 días, umbral por cuantil) y el catálogo completo de alternativas consideradas está en
+`notebooks/model_selection/anomaly_detection.ipynb`.
+
+**Limitación declarada:** es una definición, no una verdad. Un evento que ambos mercados
+anticiparon no queda marcado, aunque sea operativamente relevante. Es una elección deliberada: se
+detecta lo inesperado, no lo caro.
 
 ---
 
@@ -157,20 +196,58 @@ dispersión, el tuning individual capturaba ruido de muestreo, no diferencias re
 
 **Eventos de calidad esperados** (se registran en `outputs/reports/` y el pipeline continúa):
 
-- Cada imputación de placeholder, con el offset usado.
-- Placeholders sin donante disponible: se convierten a **NaN**, no a 0.0. El cero se propaga en
-  silencio a lags y rolling (una hora contaminada ensucia ~200 filas de features) y en detección de
+- Cada imputación aplicada, con el offset usado.
+- Placeholders sin donante: se convierten a **NaN**, no a 0.0. El cero se propaga en silencio a
+  lags y medias móviles (una hora contaminada ensucia ~200 filas de features) y en detección de
   anomalías dispara una alerta falsa masiva. NaN hace que esas filas se excluyan solas vía `dropna`.
 - Rangos recortados o procesos omitidos por los rezagos de publicación de CENACE.
 - Cobertura incompleta: horas recibidas por debajo de las esperadas.
 
-Los `assert` que validaban **lógica** del código (ausencia de fuga en rolling, continuidad de la
-codificación cíclica, invertibilidad de `signed_log1p`) se movieron a `tests/`: en un pipeline
-recurrente correrían idénticos miles de veces sin aportar nada.
+Si todo detuviera el pipeline, se caería por el 0.21% de los datos y el equipo aprendería a ignorar
+los errores. Si nada lo detuviera, un cambio en la fuente pasaría meses desapercibido.
+
+Los `assert` que validaban **lógica del código** (ausencia de fuga en rolling, continuidad de la
+codificación cíclica, invertibilidad de `signed_log1p`) están en `tests/`: en un pipeline recurrente
+correrían idénticos miles de veces sin aportar nada.
 
 ```bash
-python -m pytest tests/ -v     # 24 tests
+python -m pytest tests/ -v     # 20 tests
 ```
+
+---
+
+## Configuración
+
+Todo vive en `config/config.yaml`: rutas, nodos, rezagos de publicación, lags, ventanas,
+hiperparámetros y umbrales. Los scripts no hardcodean parámetros.
+
+**Los hiperparámetros están congelados y no se re-tunean en producción.** Provienen del tuning con
+`RandomizedSearchCV` + `TimeSeriesSplit` documentado en el notebook. Tres razones: el tuning es no
+determinista, es lento, y si el modelo se reajustara en cada corrida nadie sabría qué versión está
+operando.
+
+El notebook incluye una celda que **compara los hiperparámetros encontrados contra el config y
+avisa si difieren**, con un interruptor para reescribirlos preservando comentarios y formato.
+
+---
+
+## Dónde vive cada salida
+
+```
+data/raw/             CSV crudo consolidado y checkpoints por proceso
+data/processed/       CSV limpio, features por proceso, alertas de anomalías
+outputs/metrics/      métricas por corrida (JSON), una por etapa
+outputs/figures/      figuras generadas por el pipeline y los notebooks
+outputs/reports/      trazabilidad de calidad de datos, una fila por evento
+outputs/models/       modelos serializados (formato nativo XGBoost, no pickle)
+outputs/predictions/  pronósticos del modo operativo
+```
+
+Todos los artefactos llevan el `run_id` (`YYYYMMDDTHHMMSS`) en el nombre, y cada fila del CSV de
+pronósticos referencia el archivo de modelo que la produjo. Si dentro de un año alguien pregunta
+por qué un pronóstico decía lo que decía, el modelo exacto está en disco.
+
+`data/` y `outputs/` están en `.gitignore`: se regeneran corriendo el pipeline.
 
 ---
 
@@ -178,73 +255,41 @@ python -m pytest tests/ -v     # 24 tests
 
 ```
 notebooks/
-├── 2_EDA.ipynb                    exploración: nulos, huecos, ACF/PACF, estacionariedad
+├── EDA.ipynb                          exploración: nulos, huecos, ACF/PACF, estacionariedad
 └── model_selection/
-    ├── forecasting_pilot.ipynb    tuning y comparación XGBoost / ARIMAX / LSTM (nodo piloto)
-    ├── forecasting_all_nodes.ipynb  generalización a los 9 nodos
-    └── anomaly_detection.ipynb    5 detectores, 6 capas de evaluación, tabla de decisión
+    ├── forecasting.ipynb              tuning y comparación XGBoost / ARIMAX / LSTM
+    └── anomaly_detection.ipynb        4 detectores, etiqueta proxy, evaluación
 ```
 
-**Los notebooks no forman parte del pipeline recurrente y el orquestador no los ejecuta.** Su valor
-es documental: son donde se compararon y justificaron los modelos. Los scripts de producción
-implementan únicamente el ganador de cada track, con los parámetros que esos notebooks fijaron.
+**No forman parte del pipeline recurrente y el orquestador no los ejecuta.** Son donde se comparan
+y justifican los modelos: la evaluación completa, el backtesting y el tuning viven ahí.
 
 Si se quiere cambiar de modelo o re-tunear, el trabajo se hace en el notebook y el resultado se
 traslada a `config/config.yaml`. Nunca al revés.
 
 ---
 
-## Modelos en producción
-
-**Forecasting: XGBoost**, un modelo por nodo y horizonte (18 artefactos por corrida). Ganó por
-margen amplio: MAE 86.7 contra 104.3 de LSTM y 146.9 de ARIMAX+Fourier. Se acompaña de un baseline
-naive estacional como control continuo de que el modelo aporta valor sobre una regla trivial.
-
-**Anomalías: dos detectores complementarios** (métricas en la sección de resultados).
-
-Se operan juntos a propósito. M4 gana en el agregado pero M1 encuentra más eventos, y en monitoreo
-de precios el costo de un episodio no detectado supera al de revisar una alerta de más. Además M4
-es el peor en la métrica sin etiquetas (`EM_proxy` 0.646 contra 0.821 de M1), lo que abre la
-posibilidad de que parte de su ventaja venga de estar alineado con la definición de la etiqueta
-proxy y no de ser mejor detector. Correr ambos cubre ese riesgo sin costo relevante.
-
-La severidad sale del consenso: **1 detector = informativo, 2 = revisión del analista**.
-
-Ninguno de los dos detectores usa el MDA como feature. El MDA solo entra en la etiqueta de
-evaluación, y esa separación es lo que evita la circularidad.
-
----
-
-## Hallazgos que condicionan la operación
-
-**Los 9 nodos son una sola señal de precio.** Correlación mínima entre nodos de 1.0000, y la
-desviación estándar del F1 entre nodos es 0.005. El spread entre nodos se explica por pérdidas
-marginales; la congestión intrazonal es prácticamente nula.
-
-**El riesgo de tiempo real es unidireccional.** En la ventana de prueba, 174 de 183 sorpresas
-etiquetadas fueron al alza. Las sorpresas a la baja vienen de sobreoferta, un proceso suave que
-rara vez produce colas extremas.
-
-**Hay cambio de régimen entre periodos, y rompe los umbrales fijos.** La volatilidad de la
-divergencia MDA-MTR cae ~43% entre el periodo de entrenamiento y el de prueba. Consecuencia medida:
-en modo predict los detectores alertan a menos de la mitad de su tasa objetivo. Esta es la
-justificación empírica de la recalibración periódica, no una buena práctica genérica.
-
----
-
-## Limitaciones conocidas y siguientes pasos
+## Limitaciones y siguientes pasos
 
 | Prioridad | Acción | Por qué |
 |---|---|---|
-| 1 | Umbral adaptativo con ventana móvil de 30 días | Resuelve el sub-alertado documentado arriba; es causal, sin fuga |
+| 1 | Umbral adaptativo con ventana móvil | Los cuatro detectores sub-alertan cuando cambia el régimen; es causal, sin fuga |
 | 2 | Extracción incremental | Ver `docs/incremental_extraction_design.md` |
-| 3 | Ajustar MSTL una sola vez y proyectar a los 9 nodos | Bajaría la corrida de anomalías de ~270s a ~30s. Cambia la metodología validada, así que requiere revalidar |
-| 4 | Validación con experto sobre 150 horas estratificadas | Convierte la etiqueta proxy de supuesto a hipótesis verificada |
-| 5 | Incorporar demanda, temperatura y precio del gas | Separaría escasez explicable de anomalía genuina |
-| 6 | Forecasting del spread MTR−MDA | El spread es la señal de riesgo; pronosticarlo vale más que pronosticar el MDA |
+| 3 | Validación con experto sobre ~150 horas | Convierte la etiqueta proxy de supuesto a hipótesis verificada |
+| 4 | Incorporar demanda, temperatura y precio del gas | Separaría escasez explicable de anomalía genuina |
+| 5 | Pronóstico del spread MTR−MDA | El spread es la señal de riesgo; vale más que pronosticar el MDA |
+| 6 | Ajustar MSTL una vez y proyectar a los 9 nodos | Bajaría la corrida de ~5 min a ~30 s; requiere revalidar |
 
-Otras limitaciones a tener presentes: los resultados principales corresponden a un corte único de
-tres meses, y la validación rolling-origin muestra que la magnitud del error varía de forma
-estacional, por lo que las cifras deben leerse como orden de magnitud y no como precisión anual; los 9 nodos no son 9 observaciones independientes, así que la σ entre nodos es informativa
-de la redundancia y no un intervalo de confianza; y la etiqueta proxy es una definición defendible,
-no una verdad, que por construcción no marca eventos que ambos mercados anticiparon.
+**Otras limitaciones a tener presentes.** Los resultados corresponden a un corte único de tres
+meses de verano, así que las cifras son orden de magnitud y no precisión anual. La evaluación se
+hace sobre el nodo piloto, justificada por la correlación de 1.0000 pero no verificada nodo por
+nodo. Los nueve nodos no son nueve observaciones independientes, así que la dispersión entre ellos
+mide redundancia, no incertidumbre. Y el pipeline no incorpora variables exógenas, que explicarían
+buena parte tanto del error de pronóstico como de los eventos detectados.
+
+---
+
+## Nota sobre el desarrollo
+
+Este proyecto se desarrolló con asistencia de IA para acelerar la implementación. Las decisiones de
+diseño, la validación de resultados y la interpretación son propias.
