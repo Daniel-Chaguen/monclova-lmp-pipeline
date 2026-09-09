@@ -160,7 +160,7 @@ y justifican los modelos: la evaluación completa, el backtesting y el tuning vi
 
 ---
 
-## Nota sobre el desarrollo
+### Nota 
 
 Este proyecto se desarrolló con asistencia de IA para acelerar la implementación. Las decisiones de
 diseño, la validación de resultados y la interpretación son propias.
