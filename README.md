@@ -47,7 +47,6 @@ modelo ya decidido. La evaluación vive en los notebooks (ver más abajo).
 ./run_pipeline.sh daily                        # ruta diaria: MDA -> pronóstico
 ./run_pipeline.sh mtr                          # ruta retraso: MTR -> alertas
 ./run_pipeline.sh full 2024-01-01 2025-06-30   # carga histórica completa
-./run_pipeline.sh test                         # tests de invariantes
 ```
 
 
@@ -60,6 +59,7 @@ python scripts/preprocess.py --verbose
 python scripts/build_features.py --test-start 2025-04-01
 python scripts/run_forecasting.py
 python scripts/run_anomaly_detection.py
+```
 ---
 
 ## Resultados
