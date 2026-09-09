@@ -1,0 +1,12 @@
+data/raw/*.csv
+data/processed/*.csv
+outputs/metrics/*
+outputs/figures/*
+outputs/reports/*
+outputs/models/*
+outputs/predictions/*
+!**/.gitkeep
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/

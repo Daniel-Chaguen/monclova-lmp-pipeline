@@ -1,0 +1,11 @@
+# Pipeline de produccion. Deliberadamente ligero: TensorFlow y scikit-learn
+# quedaron fuera porque LSTM, ARIMAX, Isolation Forest y LOF viven solo en los
+# notebooks de model_selection, no en el camino recurrente.
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+PyYAML>=6.0
+xgboost>=2.0
+statsmodels>=0.14     # MSTL, usado por el detector M4
+matplotlib>=3.7
+pytest>=7.4           # tests/test_invariants.py

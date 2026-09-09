@@ -1,0 +1,141 @@
+# =============================================================================
+# Configuracion del pipeline Monclova LMP
+#
+# Todo lo que un operador podria querer cambiar vive aqui. Los scripts no
+# hardcodean parametros; los leen de este archivo y permiten sobreescribir los
+# mas volatiles (fechas, rutas) por linea de comandos.
+# =============================================================================
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  metrics_dir: outputs/metrics
+  figures_dir: outputs/figures
+  reports_dir: outputs/reports
+  models_dir: outputs/models
+  predictions_dir: outputs/predictions
+
+  raw_consolidated: data/raw/monclova_lmp_mda_mtr.csv
+  clean: data/processed/monclova_lmp_clean.csv
+  features_mda: data/processed/monclova_features_mda.csv
+  features_mtr: data/processed/monclova_features_mtr.csv
+
+# -----------------------------------------------------------------------------
+# Extraccion desde el Servicio Web de PML de CENACE (SW-PML)
+# -----------------------------------------------------------------------------
+extraction:
+  base_url: "https://ws01.cenace.gob.mx:8082/SWPML/SIM"
+  system: SIN                    # Sistema Interconectado Nacional
+  processes: [MDA, MTR]          # Dia en Adelanto y Tiempo Real
+  nodes:
+    - 06AEO-115
+    - 06AHM-400
+    - 06FRO-115
+    - 06GRA-115
+    - 06MON-115
+    - 06MON-230
+    - 06RGS-115
+    - 06TKS-115
+    - 06XOC-115
+
+  max_days_per_chunk: 7          # limite duro de la API: 1 a 7 dias por consulta
+  request_delay_seconds: 0.4     # cortesia con el servidor de CENACE
+  timeout_seconds: 30
+  retries: 5
+  backoff_factor: 1.0
+
+  # Rezagos de publicacion (Manual Tecnico SW-PML, seccion V).
+  # El servicio responde HTTP 400 si se le piden dias fuera de estas ventanas,
+  # asi que el script recorta el rango ANTES de pedir en vez de fallar.
+  mtr_publication_lag_days: 7    # MTR (Expost): hasta el Dia de Operacion -7
+  mda_max_future_days: 1         # MDA: hasta el Dia de Operacion actual o el siguiente
+
+  # Rango por defecto si no se pasa --start / --end
+  default_start: "2024-01-01"
+  default_end: "2025-06-30"
+
+# -----------------------------------------------------------------------------
+# Preprocesamiento
+# -----------------------------------------------------------------------------
+preprocess:
+  # Placeholders: filas donde pml, pml_ene, pml_per y pml_cng son 0.0 a la vez.
+  # Es un hueco de publicacion de la fuente, no un precio real de mercado.
+  placeholder_process: MDA       # proceso donde SI se esperan (y se imputan)
+  primary_lag_hours: 168         # imputar con la misma hora de la semana previa
+  max_fallback_tries: 3          # -168, +168, -336, +336, -504, +504
+
+  # Invariante duro: si mas de esta fraccion de la ventana queda sin resolver,
+  # no es un caso aislado sino un hueco prolongado en la fuente. Trona.
+  max_unresolved_fraction: 0.01
+
+# -----------------------------------------------------------------------------
+# Feature engineering
+# -----------------------------------------------------------------------------
+features:
+  target_col: pml
+  lags: [1, 2, 3, 24, 48, 72, 168]
+  rolling_windows: [24, 168]
+  test_start: "2025-04-01"       # frontera del split temporal, usada por los notebooks
+
+# -----------------------------------------------------------------------------
+# Forecasting (MDA) - hiperparametros CONGELADOS
+#
+# Provienen del tuning con RandomizedSearchCV + TimeSeriesSplit sobre el nodo
+# piloto 06MON-115 (ver notebooks/model_selection/forecasting.ipynb).
+# Se comparten entre los 9 nodos porque el EDA mostro correlacion de 1.0000
+# entre ellos: no son nueve series, son la misma senal observada en nueve puntos,
+# asi que tunear por nodo capturaria ruido de muestreo. NO se re-tunea aqui.
+# -----------------------------------------------------------------------------
+forecasting:
+  model: xgboost                 # ganador sobre LSTM y ARIMAX+Fourier (ver notebook)
+  baseline: seasonal_naive       # control barato: pml(t-24)
+
+  horizons:
+    h1:
+      label: "1h-adelante"
+      features:
+        [pml_lag1, pml_lag2, pml_lag3, pml_lag24, pml_lag48, pml_lag72, pml_lag168,
+         pml_roll24_mean, pml_roll24_std, pml_roll168_mean, pml_roll168_std,
+         hora_sin, hora_cos, dow_sin, dow_cos, is_weekend, mes]
+      naive_lag: 24
+      params:
+        max_depth: 4
+        learning_rate: 0.01
+        n_estimators: 500
+        subsample: 0.6
+        colsample_bytree: 1.0
+        min_child_weight: 1
+        random_state: 42
+
+    day_ahead:
+      label: "day-ahead"
+      # Solo informacion disponible al cierre del dia D-1: los rolling horarios
+      # no aplican, se usan las versiones "congeladas" diarias.
+      features:
+        [pml_lag24, pml_lag48, pml_lag72, pml_lag168,
+         roll24_frozen_mean, roll24_frozen_std, roll168_frozen_mean, roll168_frozen_std,
+         hora_sin, hora_cos, dow_sin, dow_cos, is_weekend, mes]
+      naive_lag: 168
+      params:
+        max_depth: 3
+        learning_rate: 0.01
+        n_estimators: 800
+        subsample: 0.6
+        colsample_bytree: 0.6
+        min_child_weight: 5
+        random_state: 42
+
+# -----------------------------------------------------------------------------
+# Deteccion de anomalias (MTR)
+#
+# Produccion opera UN detector: M4, el residual de la descomposicion MSTL.
+# La comparacion contra los otros cuatro metodos evaluados y la validacion
+# contra la divergencia MDA-MTR viven en notebooks/model_selection/
+# anomaly_detection.ipynb.
+# -----------------------------------------------------------------------------
+anomaly:
+  alert_rate: 0.01               # tasa de alerta objetivo, calibrada por nodo
+  scale_window_hours: 720        # ventana de la escala movil causal (30 dias)
+  scale_min_periods: 240         # historia minima para estimar escala (10 dias)
+  mstl_periods: [24, 168]        # doble estacionalidad: diaria y semanal
+  mstl_robust: true              # indispensable con curtosis alta
